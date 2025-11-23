@@ -19,7 +19,7 @@ const SELECTORS = {
 const LOGIN_URL = 'https://signups.org.uk/auth/login.php?xsi=12';
 const WEBSITE_USERNAME = process.env.WEBSITE_USERNAME;
 const WEBSITE_PASS = process.env.WEBSITE_PASSWORD; // Fixed variable name to match secrets
-const JOBS_PAGE_URL = process.env.JOBS_PAGE_URL || 'https://signups.org.uk/index.php'; // Ensure this URL is correct
+const JOBS_PAGE_URL = process.env.JOBS_PAGE_URL || 'https://signups.org.uk/areas/events/overview.php?settings=1&xsi=12'; // !!! UPDATED URL !!!
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_TOKEN; // Fixed variable name to match secrets
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
@@ -149,8 +149,7 @@ async function mainScraper() {
         logger.info(`[LOGIN] Success`);
 
         // Scrape Jobs Page
-        // Note: Use the variable JOBS_PAGE_URL or navigate naturally if needed
-        const targetUrl = process.env.JOBS_PAGE_URL || 'https://signups.org.uk/index.php';
+        const targetUrl = process.env.JOBS_PAGE_URL || 'https://signups.org.uk/areas/events/overview.php?settings=1&xsi=12'; // !!! UPDATED URL !!!
         logger.info(`[SCRAPE] Navigating to jobs page: ${targetUrl}`);
         
         await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
