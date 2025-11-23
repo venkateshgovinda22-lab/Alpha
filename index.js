@@ -1,10 +1,10 @@
-// index.js - Production Job Scraper - SERVERLESS VERSION (GitHub Actions Ready)
+// index.js - Production Doctor Job Scraper - SERVERLESS VERSION (GitHub Actions Ready)
 
 import { createHash } from 'crypto';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { initializeApp, getApps } from 'firebase/app';
-import { getAuth, signInWithCustomToken, signInAnonymously } from 'firebase/auth';
+import { getAuth, signInAnonymously } from 'firebase/auth';
 import { getFirestore, doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
 import winston from 'winston';
 
@@ -13,15 +13,21 @@ const SELECTORS = {
     USERNAME_INPUT: 'input[name="username"]',
     PASSWORD_INPUT: 'input[name="password"]',
     LOGIN_BUTTON: 'input[value="Login"]',
-    JOB_TABLE: 'table', 
+    JOB_TABLE: 'table', // Primary target selector
 };
 
+// Environment Variables - Ensure these are set in GitHub Secrets!
 const LOGIN_URL = 'https://signups.org.uk/auth/login.php?xsi=12';
 const WEBSITE_USERNAME = process.env.WEBSITE_USERNAME;
-const WEBSITE_PASS = process.env.WEBSITE_PASSWORD; // Fixed variable name to match secrets
-const JOBS_PAGE_URL = process.env.JOBS_PAGE_URL || 'https://signups.org.uk/areas/events/overview.php?settings=1&xsi=12'; // !!! UPDATED URL !!!
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_TOKEN; // Fixed variable name to match secrets
+const WEBSITE_PASS = process.env.WEBSITE_PASSWORD; 
+const JOBS_PAGE_URL = process.env.JOBS_PAGE_URL || 'https://signups.org.uk/areas/events/overview.php?settings=1&xsi=12';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_TOKEN; 
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+// Define the specific job role we are interested in.
+const TARGET_ROLE = 'Doctor';
+// Set this to true if you only want notifications for VACANT jobs (DoctorName === 'Unassigned')
+const ONLY_NOTIFY_VACANCIES = false; 
 
 const logger = winston.createLogger({
     level: 'info',
@@ -33,8 +39,12 @@ const logger = winston.createLogger({
 });
 
 // --- 2. FIREBASE INIT ---
-let db, auth, currentUserId;
+let db;
 
+/**
+ * Initializes Firebase App and Firestore.
+ * @returns {Promise<boolean>} True if initialized successfully.
+ */
 async function initializeFirebase() {
     try {
         const configStr = process.env.FIREBASE_CONFIG;
@@ -42,15 +52,17 @@ async function initializeFirebase() {
             logger.error('Missing FIREBASE_CONFIG');
             return false;
         }
+        
+        // Use existing app if it exists
         const app = getApps().length === 0 ? initializeApp(JSON.parse(configStr)) : getApps()[0];
-        auth = getAuth(app);
+        const auth = getAuth(app);
         db = getFirestore(app);
 
-        // Auth fallback
+        // Auth fallback - use anonymous sign-in for firestore read/write
         if (!auth.currentUser) {
             await signInAnonymously(auth);
         }
-        currentUserId = auth.currentUser ? auth.currentUser.uid : 'anonymous';
+        const currentUserId = auth.currentUser ? auth.currentUser.uid : 'anonymous';
 
         logger.info(`[FIREBASE] Connected as ${currentUserId}`);
         return true;
@@ -60,36 +72,66 @@ async function initializeFirebase() {
     }
 }
 
-// --- 3. UTILS ---
+// --- 3. UTILS (Job History) ---
+/**
+ * Creates a stable, unique ID for a job entry.
+ * @param {string} date - The date of the job.
+ * @param {string} event - The name of the event/shift.
+ * @param {string} doctor - The name of the assigned doctor (or 'Unassigned').
+ * @returns {string} The MD5 hash ID.
+ */
 function createJobId(date, event, doctor) {
     const raw = `${date}|${event}|${doctor}`.toLowerCase().replace(/\s+/g, ' ').trim();
     return createHash('md5').update(raw).digest('hex');
 }
 
+/**
+ * Checks if a job ID exists in the history collection.
+ * @param {string} jobId - The job's unique ID.
+ * @returns {Promise<boolean>} True if the job is new.
+ */
 async function isJobNew(jobId) {
     if (!db) throw new Error('Firebase not initialized');
-    // Ensure the path 'users/USER_ID/job_history' exists or use a global collection
-    // Using a simpler path for stability if user ID varies:
-    const docRef = doc(db, 'scraped_jobs', jobId); 
+    // Use a top-level collection for simplicity and stability
+    const docRef = doc(db, 'scraped_doctor_jobs', jobId); 
     return !(await getDoc(docRef)).exists();
 }
 
+/**
+ * Saves a new job entry to the history collection.
+ * @param {string} jobId - The job's unique ID.
+ * @param {object} job - The job data object.
+ */
 async function saveJobToHistory(jobId, job) {
     if (!db) throw new Error('Firebase not initialized');
-    const docRef = doc(db, 'scraped_jobs', jobId);
-    await setDoc(docRef, { ...job, jobId, savedAt: serverTimestamp() });
+    const docRef = doc(db, 'scraped_doctor_jobs', jobId);
+    await setDoc(docRef, { 
+        ...job, 
+        jobId, 
+        savedAt: serverTimestamp(),
+        // Add a clean flag for vacancy status
+        isVacancy: job.doctorName.toLowerCase().includes('unassigned') 
+    });
 }
 
+/**
+ * Creates a slight, human-like delay.
+ * @param {number} ms - Base delay in milliseconds.
+ */
 const humanDelay = (ms) => new Promise(r => setTimeout(r, ms + Math.random() * 1000));
 
 // --- 4. NOTIFICATIONS ---
+/**
+ * Sends a message to the configured Telegram chat.
+ * @param {string} text - The message text.
+ */
 async function sendTelegram(text) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
         logger.warn('[TELEGRAM] Tokens missing, skipping notification.');
         return;
     }
     try {
-        await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -99,6 +141,12 @@ async function sendTelegram(text) {
                 disable_web_page_preview: true
             })
         });
+
+        if (!response.ok) {
+            const errorBody = await response.text();
+            throw new Error(`Telegram API failed: ${response.status} - ${errorBody}`);
+        }
+
     } catch (e) {
         logger.error(`[TELEGRAM] Failed: ${e.message}`);
     }
@@ -113,23 +161,15 @@ async function mainScraper() {
 
         puppeteer.use(StealthPlugin());
         browser = await puppeteer.launch({
-            headless: "new",
+            // Use 'new' for headless mode, essential for GitHub Actions
+            headless: "new", 
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
         });
 
         const page = await browser.newPage();
-
-        // Console cleanup
-        page.on('console', msg => {
-            const text = msg.text();
-            if (!text.includes('Failed to load resource')) {
-                logger.info(`[BROWSER] ${text}`);
-            }
-        });
-
         await page.setViewport({ width: 1920, height: 1080 });
 
-        // Login
+        // --- LOGIN PROCESS ---
         logger.info(`[LOGIN] Navigating to ${LOGIN_URL}...`);
         await page.goto(LOGIN_URL, { waitUntil: 'networkidle2', timeout: 60000 });
         
@@ -142,81 +182,73 @@ async function mainScraper() {
             page.click(SELECTORS.LOGIN_BUTTON),
         ]);
 
-        // Basic check if login redirected
         if (page.url().includes('login.php')) {
-            throw new Error("Login failed - still on login page");
+            throw new Error("Login failed - still on login page. Check credentials.");
         }
         logger.info(`[LOGIN] Success`);
 
-        // Scrape Jobs Page
-        const targetUrl = process.env.JOBS_PAGE_URL || 'https://signups.org.uk/areas/events/overview.php?settings=1&xsi=12'; // !!! UPDATED URL !!!
-        logger.info(`[SCRAPE] Navigating to jobs page: ${targetUrl}`);
+        // --- SCRAPE JOBS PAGE ---
+        logger.info(`[SCRAPE] Navigating to jobs page: ${JOBS_PAGE_URL}`);
+        await page.goto(JOBS_PAGE_URL, { waitUntil: 'networkidle2', timeout: 60000 });
         
-        await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
-        
-        // Wait for table or body
+        // Wait for the table to ensure content is loaded
         try {
-            await page.waitForSelector('table', { timeout: 15000 });
+            await page.waitForSelector(SELECTORS.JOB_TABLE, { timeout: 15000 });
         } catch (e) {
-            logger.warn('No table found, might be no jobs or different layout.');
+             logger.warn('Job table not found on page. Ending scrape.');
+             return { status: "success", new: 0 };
         }
 
-        // --- PARSING LOGIC ---
-        const jobs = await page.evaluate(() => {
+        // --- PARSING LOGIC (Client-Side) ---
+        // This is where the core logic is now more robust.
+        const jobs = await page.evaluate((targetRole) => {
             const results = [];
             let currentDate = 'Unknown Date';
             let currentEvent = 'Unknown Event';
 
-            const rows = Array.from(document.querySelectorAll('table tr'));
-            console.log(`Processing ${rows.length} rows for extraction...`);
+            // Function to check if a string contains a date format (Mon, Tue, etc.)
+            const isDateRow = (text) => /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i.test(text);
+            // Function to check for time range (e.g., 09:00 - 17:00)
+            const isTimeRange = (text) => /\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}/.test(text);
 
-            // --- TEMPORARY DIAGNOSTIC CODE START ---
-            console.log("--- RAW DATA DIAGNOSTIC ---");
-            for (const row of rows) {
-                // Get all cells and trim whitespace
-                const cells = Array.from(row.querySelectorAll('td')).map(td => td.innerText.trim());
-                if (cells.length > 0) {
-                    // Print the raw array of cells for this row
-                    console.log("RAW_ROW:", JSON.stringify(cells)); 
-                }
-            }
-            console.log("--- END RAW DIAGNOSTIC ---");
-            // --- TEMPORARY DIAGNOSTIC CODE END ---
+            const rows = Array.from(document.querySelectorAll('table tr'));
             
             for (const row of rows) {
+                // Get all cells and trim whitespace. Use innerText for visible text.
                 const cells = Array.from(row.querySelectorAll('td')).map(td => td.innerText.trim());
                 if (cells.length === 0) continue;
 
                 const col0 = cells[0];
-
-                // Regex Checks
-                const isDateRow = /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i.test(col0);
-                const isTimeRange = /\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}/.test(col0);
-
+                
                 // 1. Header Row (Date)
-                if (isDateRow && !isTimeRange) {
+                if (isDateRow(col0) && !isTimeRange(col0)) {
                     currentDate = col0;
-                    currentEvent = 'Unknown Event';
+                    currentEvent = 'Unknown Event'; // Reset event when a new date is found
                     continue;
                 }
 
-                // 2. Event Parent Row
-                if (isTimeRange) {
-                    if (cells[1]) {
-                        currentEvent = cells[1].replace(/\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}/g, '').trim();
-                    }
-                    // Check for immediate doctor assignment in this row
-                    if (cells.length > 2 && cells[2] === 'Doctor') {
-                        const docName = (cells.length > 4) ? cells[4] : 'Unassigned';
-                        if (currentEvent !== 'Unknown Event') {
-                            results.push({ date: currentDate, eventName: currentEvent, doctorName: docName });
+                // 2. Event Parent Row (A row that contains the time range and event name)
+                if (isTimeRange(col0)) {
+                    if (cells.length > 1) {
+                        // The event name is usually in cell[1] but might contain the time range if it's not split
+                        // Safely extract the event name by removing the time range.
+                        currentEvent = cells[1].replace(/\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}/g, '').trim() || cells[1].trim();
+                        
+                        // Check for 'Doctor' job assignment within this parent row structure (Cells[2] == Role)
+                        if (cells.length > 2 && cells[2] === targetRole) {
+                             const docName = (cells.length > 4) ? cells[4] : 'Unassigned';
+                             if (currentEvent !== 'Unknown Event') {
+                                 results.push({ date: currentDate, eventName: currentEvent, doctorName: docName });
+                             }
                         }
                     }
                     continue;
                 }
 
-                // 3. Child Job Row
-                if (col0 === 'Doctor') {
+                // 3. Child Job Row (A row that starts with the Role name, e.g., 'Doctor')
+                // This captures subsequent role rows related to the last 'currentEvent'
+                if (col0 === targetRole) {
+                    // Doctor name is expected in cell[2] for child rows
                     const docName = (cells.length > 2) ? cells[2] : 'Unassigned';
                     if (currentDate !== 'Unknown Date' && currentEvent !== 'Unknown Event') {
                         results.push({ date: currentDate, eventName: currentEvent, doctorName: docName });
@@ -224,16 +256,24 @@ async function mainScraper() {
                 }
             }
             return results;
-        });
+        }, TARGET_ROLE); // Pass TARGET_ROLE into the evaluate context
 
-        logger.info(`[SCRAPE] Found ${jobs.length} potential Doctor jobs.`);
+        logger.info(`[SCRAPE] Found ${jobs.length} potential '${TARGET_ROLE}' jobs.`);
 
-        // Process & Filter
+        // --- PROCESSING & NOTIFICATION ---
         const newJobs = [];
-        for (const job of jobs) {
+        
+        // 1. Filter for vacancies if requested
+        const relevantJobs = ONLY_NOTIFY_VACANCIES
+            ? jobs.filter(job => job.doctorName.toLowerCase().includes('unassigned'))
+            : jobs;
+
+        logger.info(`[SCRAPE] ${relevantJobs.length} relevant jobs for history check (Vacant only: ${ONLY_NOTIFY_VACANCIES}).`);
+
+        // 2. Check history and save new jobs
+        for (const job of relevantJobs) {
+            // Ensure data integrity before hashing
             if (job.date === 'Unknown Date' || job.eventName === 'Unknown Event') continue;
-            // We only care about Unassigned jobs if looking for vacancies? 
-            // Or all jobs? Assuming we notify on ANY new entry for now.
             
             const id = createJobId(job.date, job.eventName, job.doctorName);
             
@@ -243,18 +283,28 @@ async function mainScraper() {
             }
         }
 
+        // 3. Send Notification
         if (newJobs.length > 0) {
-            const list = newJobs.map((j, i) => `${i + 1}. ${j.date}\n   ${j.eventName}\n   ${j.doctorName}`).join('\n\n');
-            await sendTelegram(`🚨 *NEW DOCTOR JOBS FOUND*\n\n${list}`);
+            const heading = ONLY_NOTIFY_VACANCIES 
+                ? `🚨 *NEW DOCTOR VACANCIES FOUND* (${newJobs.length})`
+                : `🚨 *NEW DOCTOR JOBS POSTED* (${newJobs.length})`;
+
+            const list = newJobs.map((j, i) => 
+                `${i + 1}. *${j.eventName}* on ${j.date}\n- Status: ${j.doctorName.includes('Unassigned') ? '**VACANT**' : j.doctorName}`
+            ).join('\n\n');
+            
+            await sendTelegram(`${heading}\n\n${list}\n\n[View Jobs](${JOBS_PAGE_URL})`);
+            logger.info(`[NOTIFY] Sent Telegram alert for ${newJobs.length} new jobs.`);
         } else {
-            logger.info('[SCRAPE] No new unique jobs found.');
+            logger.info('[SCRAPE] No new unique jobs found after filtering.');
         }
 
         return { status: "success", new: newJobs.length };
 
     } catch (e) {
+        // Critical failures
         logger.error(`[CRITICAL] ${e.message}`);
-        await sendTelegram(`⚠️ Scraper Error: ${e.message}`);
+        await sendTelegram(`❌ CRITICAL SCRAPER FAILURE\n\nError: \`${e.message}\`\n\n*Check logs and GitHub Secrets.*`);
         return { status: "error", message: e.message };
     } finally {
         if (browser) await browser.close();
@@ -263,11 +313,11 @@ async function mainScraper() {
 
 // --- 6. EXECUTION BLOCK (NO SERVER) ---
 (async () => {
-    logger.info('[START] Starting Hourly Scrape...');
+    logger.info('[START] Starting Scheduled Scrape...');
     const result = await mainScraper();
     
     if (result.status === 'success') {
-        logger.info('[EXIT] Scrape completed successfully.');
+        logger.info(`[EXIT] Scrape completed successfully. New jobs found: ${result.new}`);
         process.exit(0);
     } else {
         logger.error('[EXIT] Scrape failed.');
