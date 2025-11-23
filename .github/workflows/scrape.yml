@@ -1,0 +1,41 @@
+name: Hourly Job Scraper
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape_node:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run the scraper script
+        env: 
+          # REMINDER: Replace these with your actual secret names
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          SITE_USER: ${{ secrets.WEBSITE_USERNAME }}
+          # ... other secrets
+        run: node index.js
+
+      - name: Commit and Push Data
+        run: |
+          git config --global user.name 'GitHub Action'
+          git config --global user.email 'action@github.com'
+          git add -A
+          git commit -m "Auto-update job data" || exit 0
+          git push
