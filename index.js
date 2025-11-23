@@ -48,7 +48,7 @@ async function initializeFirebase() {
 
         // Auth fallback
         if (!auth.currentUser) {
-             await signInAnonymously(auth);
+            await signInAnonymously(auth);
         }
         currentUserId = auth.currentUser ? auth.currentUser.uid : 'anonymous';
 
@@ -169,6 +169,20 @@ async function mainScraper() {
             let currentEvent = 'Unknown Event';
 
             const rows = Array.from(document.querySelectorAll('table tr'));
+            console.log(`Processing ${rows.length} rows for extraction...`);
+
+            // --- TEMPORARY DIAGNOSTIC CODE START ---
+            console.log("--- RAW DATA DIAGNOSTIC ---");
+            for (const row of rows) {
+                // Get all cells and trim whitespace
+                const cells = Array.from(row.querySelectorAll('td')).map(td => td.innerText.trim());
+                if (cells.length > 0) {
+                    // Print the raw array of cells for this row
+                    console.log("RAW_ROW:", JSON.stringify(cells)); 
+                }
+            }
+            console.log("--- END RAW DIAGNOSTIC ---");
+            // --- TEMPORARY DIAGNOSTIC CODE END ---
             
             for (const row of rows) {
                 const cells = Array.from(row.querySelectorAll('td')).map(td => td.innerText.trim());
