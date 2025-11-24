@@ -8,12 +8,16 @@ concurrency:
 on:
   schedule:
     # 1. PEAK HOURS (Mon-Fri): Every 15 minutes
+    #    06:00 to 21:00 UTC
     - cron: '*/15 6-21 * * 1-5'
     
     # 2. OFF-PEAK (Mon-Fri Nights): Every Hour
-    - cron: '0 22-5 * * 1-5'
+    #    GitHub Fix: Split '22-5' into two separate lines
+    - cron: '0 22-23 * * 1-5'  # 10 PM and 11 PM
+    - cron: '0 0-5 * * 1-5'    # Midnight to 5 AM
 
     # 3. WEEKENDS: Every Hour
+    #    08:00 to 22:00 UTC
     - cron: '0 8-22 * * 6,0'
 
   # Allows manual testing
@@ -40,7 +44,7 @@ jobs:
         run: npm install
 
       - name: Run Scraper
-        id: run_scraper_step # Give this step an ID to reference
+        id: run_scraper_step
         env:
           WEBSITE_USERNAME: ${{ secrets.WEBSITE_USERNAME }}
           WEBSITE_PASSWORD: ${{ secrets.WEBSITE_PASSWORD }}
@@ -48,14 +52,12 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FIREBASE_CONFIG: ${{ secrets.FIREBASE_CONFIG }}
           JOBS_PAGE_URL: ${{ secrets.JOBS_PAGE_URL }} 
-        # The '|| exit 0' prevents the overall job from failing if the script fails, 
-        # which lets the final notification step run properly.
-        run: node index.js || exit 0 
+        # We let this step fail naturally so the next step detects it
+        run: node index.js
       
-      - name: 🚨 Notify on Workflow Failure (Final Check)
-        # This step runs if the previous steps failed OR if the overall job times out.
-        # It ensures you get a notification even if index.js didn't start its own error logic.
-        if: ${{ failure() || cancelled() }}
+      - name: 🚨 Notify on Workflow Failure
+        # This step ONLY runs if the 'Run Scraper' step failed or timed out
+        if: failure() 
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -64,7 +66,7 @@ jobs:
             ⚠️ **WORKFLOW CRITICAL FAILURE** ⚠️
             
             *Job:* ${{ github.workflow }}
-            *Status:* Failed/Timeout (Exceeded 10 mins)
+            *Reason:* Scraper crashed or hit 10-minute timeout.
             *Repo:* ${{ github.repository }}
-            *Check Logs:* ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            *Check Logs:* https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           disable_web_page_preview: true
