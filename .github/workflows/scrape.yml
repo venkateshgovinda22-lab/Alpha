@@ -1,4 +1,4 @@
-name: Mercy Medical Scraper
+name: Alpha
 
 # Concurrency: Prevents two scrapers from writing to the DB at the exact same time
 concurrency: 
