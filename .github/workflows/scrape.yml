@@ -10,16 +10,27 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    
+    # --- CRITICAL FIX: The `env` variables are now mapped to the names expected by index.js ---
     env:
-      # Required - set these in your repository secrets (recommended) or here for testing
-      SCRAPE_URL: ${{ secrets.SCRAPE_URL }}
+      # CRITICAL FIX 1: Remapping the URL name. 
+      # Your index.js checks for JOBS_PAGE_URL, so we must map your secret (SCRAPE_URL) to that name.
+      JOBS_PAGE_URL: ${{ secrets.SCRAPE_URL }} 
+      
       FIREBASE_CONFIG: ${{ secrets.FIREBASE_CONFIG }}
-      # Optional Telegram notifications
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      
+      # FIX 2 (Telegram Warning): The index.js code expects TELEGRAM_TOKEN, not TELEGRAM_BOT_TOKEN
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # The index.js code also expects these, even if they are empty
+      WEBSITE_USERNAME: ${{ secrets.WEBSITE_USERNAME }}
+      WEBSITE_PASSWORD: ${{ secrets.WEBSITE_PASSWORD }}
+
       # Optional selectors overrides
       # LIST_CONTAINER_SELECTOR: '.results'
       # ITEM_ROW_SELECTOR: '.job-row'
+      
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,5 +45,17 @@ jobs:
         run: npm ci
 
       - name: Run scraper
-        # ensure envs are passed; secrets already mapped at job level
         run: node index.js
+
+      - name: 🚨 Notify on Workflow Failure
+        if: failure()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            ⚠️ **WORKFLOW CRITICAL FAILURE** ⚠️
+            
+            *Job:* Scraper Alpha-7
+            *Reason:* Scraper crashed or hit 10-minute timeout.
+            *View Logs:* ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
