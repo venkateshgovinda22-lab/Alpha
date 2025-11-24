@@ -1,18 +1,21 @@
 /**
  * index.js
  *
- * ES Module conversion and industrial-grade refactor of the original Node.js scraper.
+ * ES Module scraper using Puppeteer + Firebase client SDK (modular) + Telegram notifications.
  *
- * Changes in this version:
- * - Converted all require(...) calls to ES Module import syntax to match "type": "module".
- * - Replaced dynamic require(...) JSON loading with fs-based reads (compatible with ESM).
- * - Preserved the robust error handling, retries, Firestore batching, and date-only extraction logic.
+ * Key fixes in this version:
+ * - Removed firebase-admin (server SDK) usage and replaced with client-side Firebase SDK:
+ *   import { initializeApp } from 'firebase/app' and { getFirestore, writeBatch, doc, serverTimestamp } from 'firebase/firestore'.
+ * - Uses FIREBASE_CONFIG (JSON string) or FIREBASE_CONFIG_PATH environment variable for client config.
+ * - Avoids importing node-fetch directly; uses global fetch when available (Node 18+). If fetch is not available,
+ *   Telegram notifications are skipped to avoid adding dependencies that may not be installed.
+ * - Keeps robust error handling, retries, Firestore batch writes, and date-only extraction.
  *
- * Environment variables (same as before):
+ * Required environment variables:
  * - SCRAPE_URL
+ * - FIREBASE_CONFIG (JSON string) OR FIREBASE_CONFIG_PATH (path to json file)
+ * - FIREBASE_PROJECT_ID (optional but recommended)
  * - PUPPETEER_HEADLESS (optional, default "true")
- * - FIREBASE_SERVICE_ACCOUNT (JSON string) OR FIREBASE_SERVICE_ACCOUNT_PATH (path to json file)
- * - FIREBASE_PROJECT_ID
  * - TELEGRAM_BOT_TOKEN (optional)
  * - TELEGRAM_CHAT_ID (optional)
  *
@@ -20,12 +23,18 @@
  */
 
 import puppeteer from 'puppeteer';
-import admin from 'firebase-admin';
 import crypto from 'crypto';
-import fetch from 'node-fetch';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+import { initializeApp } from 'firebase/app';
+import {
+  getFirestore,
+  writeBatch,
+  doc as firestoreDoc,
+  serverTimestamp,
+} from 'firebase/firestore';
 
 const __filename = fileURLToPath(import.meta.url);
 
@@ -40,55 +49,60 @@ const error = (...args) => console.error(new Date().toISOString(), '[ERROR]', ..
 
 /* ----------------------------- Initialization ----------------------------- */
 
-function initFirebase() {
-  // If already initialized, return app
-  if (admin.apps && admin.apps.length) {
-    return admin.app();
-  }
+/**
+ * Initialize Firebase client SDK using FIREBASE_CONFIG (stringified JSON) or FIREBASE_CONFIG_PATH.
+ * Returns the initialized app and Firestore instance.
+ */
+function initFirebaseClient() {
+  // Prefer FIREBASE_CONFIG env var (JSON string)
+  let firebaseConfig = null;
 
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  if (!projectId) {
-    throw new Error('FIREBASE_PROJECT_ID environment variable is required.');
-  }
-
-  let serviceAccount;
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  if (process.env.FIREBASE_CONFIG) {
     try {
-      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+      firebaseConfig = JSON.parse(process.env.FIREBASE_CONFIG);
     } catch (err) {
-      throw new Error('FIREBASE_SERVICE_ACCOUNT is not valid JSON.');
+      throw new Error('FIREBASE_CONFIG is not valid JSON.');
     }
-  } else if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
-    // Read JSON credentials from provided path
-    const providedPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
-    // Resolve relative paths against cwd
+  } else if (process.env.FIREBASE_CONFIG_PATH) {
+    const providedPath = process.env.FIREBASE_CONFIG_PATH;
     const resolved = path.isAbsolute(providedPath)
       ? providedPath
       : path.resolve(process.cwd(), providedPath);
     try {
       const raw = fs.readFileSync(resolved, 'utf8');
-      serviceAccount = JSON.parse(raw);
+      firebaseConfig = JSON.parse(raw);
     } catch (err) {
-      throw new Error(`Failed loading service account JSON from path "${resolved}": ${err.message}`);
+      throw new Error(`Failed loading FIREBASE_CONFIG from path "${resolved}": ${err.message}`);
     }
   } else {
-    throw new Error('Either FIREBASE_SERVICE_ACCOUNT (JSON string) or FIREBASE_SERVICE_ACCOUNT_PATH must be provided.');
+    throw new Error('Either FIREBASE_CONFIG (JSON string) or FIREBASE_CONFIG_PATH must be provided.');
   }
 
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    projectId,
-  });
+  // Initialize app (idempotent: multiple calls safe in most environments)
+  const app = initializeApp(firebaseConfig);
 
-  info('Initialized Firebase Admin SDK for project', projectId);
-  return admin.app();
+  // Initialize Firestore
+  const db = getFirestore(app);
+
+  info('Initialized Firebase client SDK.');
+
+  return { app, db };
 }
 
+/**
+ * Send Telegram message using global fetch if available.
+ * If fetch is not available in the runtime, the function will log a warning and return.
+ */
 async function sendTelegramMessage(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!token || !chatId) {
     warn('Telegram not configured (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing). Skipping notification.');
+    return;
+  }
+
+  if (typeof globalThis.fetch !== 'function') {
+    warn('global fetch is not available in this Node runtime. Skipping Telegram notification to avoid extra dependencies.');
     return;
   }
 
@@ -106,7 +120,7 @@ async function sendTelegramMessage(text) {
       info('Telegram notification sent.');
     }
   } catch (err) {
-    warn('Error sending Telegram message:', err.message || err);
+    warn('Error sending Telegram message:', err && (err.message || err));
   }
 }
 
@@ -162,8 +176,11 @@ async function waitForSelectorWithRetries(page, selector, opts = {}) {
 /**
  * Given a raw text extracted from the "green row" date element, return a date-only string.
  *
- * Returns either a preserved human-readable month format (e.g., "Dec 20, 2025"),
- * or an ISO date "YYYY-MM-DD". Returns null if no reliable date can be extracted.
+ * Rules:
+ * - Remove any explicit time components and timezone abbreviations.
+ * - If the remaining text contains a month name (e.g., "Dec 20, 2025"), preserve that format.
+ * - If relative ("today", "yesterday"), convert to YYYY-MM-DD.
+ * - Otherwise standardize to YYYY-MM-DD when parseable.
  */
 function extractDateOnly(rawText, now = new Date()) {
   if (!rawText || typeof rawText !== 'string') return null;
@@ -202,7 +219,7 @@ function extractDateOnly(rawText, now = new Date()) {
   // Collapse whitespace & trim
   s = s.replace(/\s+/g, ' ').trim();
 
-  // If string contains month names, preserve the human readable format (sans time)
+  // Preserve human-readable month formats if present
   const monthPattern = /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/i;
   if (monthPattern.test(s)) {
     const human = s.replace(/,\s*$/, '').trim();
@@ -260,8 +277,8 @@ async function runScraper() {
   const startTime = Date.now();
   info('Scraper starting');
 
-  const app = initFirebase();
-  const db = admin.firestore();
+  // Initialize client-side Firebase
+  const { db } = initFirebaseClient();
 
   const scrapeUrl = process.env.SCRAPE_URL;
   if (!scrapeUrl) {
@@ -301,9 +318,8 @@ async function runScraper() {
     );
 
     const listContainerSelector = process.env.LIST_CONTAINER_SELECTOR || '.job-listing, .results, #results';
-    let containerHandle;
     try {
-      containerHandle = await waitForSelectorWithRetries(page, listContainerSelector, { attempts: 2 });
+      await waitForSelectorWithRetries(page, listContainerSelector, { attempts: 2 });
     } catch (err) {
       warn(`List container not found with default selector (${listContainerSelector}). Will proceed, attempting best-effort scraping.`);
     }
@@ -364,7 +380,7 @@ async function runScraper() {
 
     info(`Normalized ${normalized.length} unique job entries.`);
 
-    // Firestore batch writes
+    // Firestore batch writes using client SDK
     const BATCH_MAX = 400;
     const batches = [];
     for (let i = 0; i < normalized.length; i += BATCH_MAX) {
@@ -373,9 +389,10 @@ async function runScraper() {
 
     let totalWrites = 0;
     for (const chunk of batches) {
-      const batch = db.batch();
+      const batch = writeBatch(db);
       for (const job of chunk) {
-        const docRef = db.collection('jobs').doc(job.id);
+        const docRef = firestoreDoc(db, 'jobs', job.id);
+        // Use merge to avoid overwriting unrelated fields
         batch.set(
           docRef,
           {
@@ -385,13 +402,14 @@ async function runScraper() {
             date: job.date || null,
             rawDate: job.rawDate || null,
             url: job.url,
-            scrapedAt: admin.firestore.FieldValue.serverTimestamp(),
+            scrapedAt: serverTimestamp(),
           },
           { merge: true }
         );
         totalWrites += 1;
       }
 
+      // Commit with retry
       await retry(
         () => batch.commit(),
         {
@@ -408,17 +426,20 @@ async function runScraper() {
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     info(`Scraping finished in ${elapsed} seconds.`);
 
+    // Optionally send a summary Telegram message on success
     if (process.env.SEND_SUMMARY !== 'false') {
-      sendTelegramMessage(`Scraper finished successfully. ${normalized.length} jobs processed. Duration: ${elapsed}s.`);
+      // Send but don't await to avoid blocking finalization unnecessarily
+      sendTelegramMessage(`Scraper finished successfully. ${normalized.length} jobs processed. Duration: ${elapsed}s.`).catch(() => {});
     }
 
     return { success: true, processed: normalized.length };
   } catch (err) {
     error('Fatal error during scraping:', err && err.stack ? err.stack : err);
+    // Send a critical Telegram notification if possible
     try {
       await sendTelegramMessage(`Scraper failed: ${err.message || err}`);
     } catch (notifErr) {
-      warn('Failed sending failure notification:', notifErr && notifErr.message ? notifErr.message : notifErr);
+      warn('Failed sending failure notification:', notifErr && (notifErr.message || notifErr));
     }
     return { success: false, error: err.message || String(err) };
   } finally {
@@ -427,7 +448,7 @@ async function runScraper() {
         await browser.close();
         info('Browser closed.');
       } catch (err) {
-        warn('Error closing browser:', err && err.message ? err.message : err);
+        warn('Error closing browser:', err && (err.message || err));
       }
     }
   }
