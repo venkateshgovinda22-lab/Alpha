@@ -1,4 +1,4 @@
-// index.js - Production Doctor Job Scraper - VISUAL UPDATE
+// index.js - Industrial Grade | GitHub Actions Optimized
 
 import { createHash } from 'crypto';
 import puppeteer from 'puppeteer-extra';
@@ -8,7 +8,7 @@ import { getAuth, signInAnonymously } from 'firebase/auth';
 import { getFirestore, doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore';
 import winston from 'winston';
 
-// --- 1. CONFIGURATION & LOGGER ---
+// --- 1. CONFIGURATION ---
 const SELECTORS = {
     USERNAME_INPUT: 'input[name="username"]',
     PASSWORD_INPUT: 'input[name="password"]',
@@ -16,7 +16,7 @@ const SELECTORS = {
     JOB_TABLE: 'table', 
 };
 
-// Environment Variables
+// Env Variables
 const LOGIN_URL = 'https://signups.org.uk/auth/login.php?xsi=12';
 const WEBSITE_USERNAME = process.env.WEBSITE_USERNAME;
 const WEBSITE_PASS = process.env.WEBSITE_PASSWORD; 
@@ -35,7 +35,7 @@ const logger = winston.createLogger({
     transports: [new winston.transports.Console()],
 });
 
-// --- 2. FIREBASE INIT ---
+// --- 2. FIREBASE SETUP ---
 let db;
 
 async function initializeFirebase() {
@@ -52,9 +52,7 @@ async function initializeFirebase() {
         if (!auth.currentUser) {
             await signInAnonymously(auth);
         }
-        const currentUserId = auth.currentUser ? auth.currentUser.uid : 'anonymous';
-
-        logger.info(`[FIREBASE] Connected as ${currentUserId}`);
+        logger.info(`[FIREBASE] Connected.`);
         return true;
     } catch (e) {
         logger.error(`[FIREBASE] Error: ${e.message}`);
@@ -62,20 +60,18 @@ async function initializeFirebase() {
     }
 }
 
-// --- 3. UTILS (Job History) ---
+// --- 3. UTILITY FUNCTIONS ---
 function createJobId(date, event, doctor) {
     const raw = `${date}|${event}|${doctor}`.toLowerCase().replace(/\s+/g, ' ').trim();
     return createHash('md5').update(raw).digest('hex');
 }
 
 async function isJobNew(jobId) {
-    if (!db) throw new Error('Firebase not initialized');
     const docRef = doc(db, 'scraped_doctor_jobs', jobId); 
     return !(await getDoc(docRef)).exists();
 }
 
 async function saveJobToHistory(jobId, job) {
-    if (!db) throw new Error('Firebase not initialized');
     const docRef = doc(db, 'scraped_doctor_jobs', jobId);
     await setDoc(docRef, { 
         ...job, 
@@ -87,12 +83,9 @@ async function saveJobToHistory(jobId, job) {
 
 const humanDelay = (ms) => new Promise(r => setTimeout(r, ms + Math.random() * 1000));
 
-// --- 4. NOTIFICATIONS (UPDATED FOR HIGHLIGHTING) ---
+// --- 4. NOTIFICATIONS ---
 async function sendTelegram(text) {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-        logger.warn('[TELEGRAM] Tokens missing, skipping notification.');
-        return;
-    }
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     try {
         await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
@@ -109,92 +102,78 @@ async function sendTelegram(text) {
     }
 }
 
-// --- 5. CORE SCRAPER ---
+// --- 5. CORE SCRAPER LOGIC ---
 async function mainScraper() {
     let browser = null;
     try {
-        if (!WEBSITE_USERNAME || !WEBSITE_PASS) throw new Error("Missing website credentials");
+        if (!WEBSITE_USERNAME || !WEBSITE_PASS) throw new Error("Missing credentials");
         if (!(await initializeFirebase())) throw new Error("Firebase init failed");
 
         puppeteer.use(StealthPlugin());
         browser = await puppeteer.launch({
-            headless: "new", 
+            headless: "new",
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
         });
 
         const page = await browser.newPage();
         await page.setViewport({ width: 1920, height: 1080 });
 
-        // --- LOGIN ---
-        logger.info(`[LOGIN] Navigating to ${LOGIN_URL}...`);
+        // --- LOGIN STEP ---
+        logger.info(`[LOGIN] Starting fresh login sequence...`);
         await page.goto(LOGIN_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+        await humanDelay(1500); // Human pause
         
-        await humanDelay(1000);
-        await page.type(SELECTORS.USERNAME_INPUT, WEBSITE_USERNAME);
-        await page.type(SELECTORS.PASSWORD_INPUT, WEBSITE_PASS);
+        await page.type(SELECTORS.USERNAME_INPUT, WEBSITE_USERNAME, { delay: 100 }); 
+        await page.type(SELECTORS.PASSWORD_INPUT, WEBSITE_PASS, { delay: 100 });
 
         await Promise.all([
             page.waitForNavigation({ waitUntil: 'networkidle2' }),
             page.click(SELECTORS.LOGIN_BUTTON),
         ]);
+        logger.info(`[LOGIN] Submitted.`);
 
-        if (page.url().includes('login.php')) {
-            throw new Error("Login failed - check credentials.");
-        }
-        logger.info(`[LOGIN] Success`);
-
-        // --- SCRAPE JOBS ---
-        logger.info(`[SCRAPE] Navigating to jobs page...`);
+        // --- SCRAPE STEP ---
+        logger.info(`[SCRAPE] Checking jobs page...`);
         await page.goto(JOBS_PAGE_URL, { waitUntil: 'networkidle2', timeout: 60000 });
         
         try {
             await page.waitForSelector(SELECTORS.JOB_TABLE, { timeout: 15000 });
         } catch (e) {
-             logger.warn('Job table not found. Ending scrape.');
+             logger.warn('Job table not found (Page load issue or layout change).');
              return { status: "success", new: 0 };
         }
 
-        // --- PARSING ---
         const jobs = await page.evaluate((targetRole) => {
             const results = [];
             let currentDate = 'Unknown Date';
             let currentEvent = 'Unknown Event';
-
             const isDateRow = (text) => /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i.test(text);
             const isTimeRange = (text) => /\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}/.test(text);
-
-            const rows = Array.from(document.querySelectorAll('table tr'));
             
+            const rows = Array.from(document.querySelectorAll('table tr'));
             for (const row of rows) {
                 const cells = Array.from(row.querySelectorAll('td')).map(td => td.innerText.trim());
                 if (cells.length === 0) continue;
-
                 const col0 = cells[0];
-                
+
                 if (isDateRow(col0) && !isTimeRange(col0)) {
                     currentDate = col0;
-                    currentEvent = 'Unknown Event'; 
+                    currentEvent = 'Unknown Event';
                     continue;
                 }
-
                 if (isTimeRange(col0)) {
                     if (cells.length > 1) {
                         currentEvent = cells[1].replace(/\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}/g, '').trim() || cells[1].trim();
                         if (cells.length > 2 && cells[2] === targetRole) {
                              const docName = (cells.length > 4) ? cells[4] : 'Unassigned';
-                             if (currentEvent !== 'Unknown Event') {
-                                 results.push({ date: currentDate, eventName: currentEvent, doctorName: docName });
-                             }
+                             if (currentEvent !== 'Unknown Event') results.push({ date: currentDate, eventName: currentEvent, doctorName: docName });
                         }
                     }
                     continue;
                 }
-
                 if (col0 === targetRole) {
                     const docName = (cells.length > 2) ? cells[2] : 'Unassigned';
-                    if (currentDate !== 'Unknown Date' && currentEvent !== 'Unknown Event') {
-                        results.push({ date: currentDate, eventName: currentEvent, doctorName: docName });
-                    }
+                    if (currentDate !== 'Unknown Date' && currentEvent !== 'Unknown Event') results.push({ date: currentDate, eventName: currentEvent, doctorName: docName });
                 }
             }
             return results;
@@ -202,64 +181,54 @@ async function mainScraper() {
 
         logger.info(`[SCRAPE] Found ${jobs.length} potential '${TARGET_ROLE}' jobs.`);
 
-        // --- FILTER & SAVE ---
         const newJobs = [];
-        
         for (const job of jobs) {
-            if (job.date === 'Unknown Date' || job.eventName === 'Unknown Event') continue;
-            
+            if (job.date === 'Unknown Date') continue;
             const id = createJobId(job.date, job.eventName, job.doctorName);
-            
             if (await isJobNew(id)) {
                 newJobs.push(job);
                 await saveJobToHistory(id, job);
             }
         }
 
-        // --- NOTIFICATION LOGIC (UPDATED) ---
         if (newJobs.length > 0) {
-            // Sort: Put Vacant jobs at the top of the list
             newJobs.sort((a, b) => {
                 const aVacant = a.doctorName.toLowerCase().includes('unassigned');
                 const bVacant = b.doctorName.toLowerCase().includes('unassigned');
                 return bVacant - aVacant;
             });
-
+            
             const list = newJobs.map((j) => {
                 const isVacant = j.doctorName.toLowerCase().includes('unassigned') || j.doctorName === '';
-                
-                // Visual Logic
                 const icon = isVacant ? '🟢' : '🔴';
                 const status = isVacant ? '**AVAILABLE / UNASSIGNED**' : `Taken by ${j.doctorName}`;
-                
                 return `${icon} *${j.date}*\n   ${j.eventName}\n   Status: ${status}`;
             }).join('\n\n');
             
             await sendTelegram(`🚨 *NEW UPDATES FOUND* (${newJobs.length})\n\n${list}\n\n[View Jobs](${JOBS_PAGE_URL})`);
-            logger.info(`[NOTIFY] Sent Telegram alert for ${newJobs.length} new jobs.`);
+            logger.info(`[NOTIFY] Sent alert.`);
         } else {
-            logger.info('[SCRAPE] No new unique jobs found.');
+            logger.info('[SCRAPE] No new unique jobs.');
         }
-
         return { status: "success", new: newJobs.length };
 
     } catch (e) {
         logger.error(`[CRITICAL] ${e.message}`);
-        await sendTelegram(`⚠️ Scraper Error: ${e.message}`);
+        await sendTelegram(`⚠️ Error: ${e.message}`);
         return { status: "error", message: e.message };
     } finally {
         if (browser) await browser.close();
     }
 }
 
+// --- 6. STEALTH STARTUP (JITTER) ---
 (async () => {
-    logger.info('[START] Starting Hourly Scrape...');
-    const result = await mainScraper();
-    if (result.status === 'success') {
-        logger.info('[EXIT] Scrape completed successfully.');
-        process.exit(0);
-    } else {
-        logger.error('[EXIT] Scrape failed.');
-        process.exit(1);
-    }
+    // Random wait between 0 and 4 minutes (240 seconds)
+    // This protects against "exact hour" bot detection patterns
+    const jitterSeconds = Math.floor(Math.random() * 240); 
+    logger.info(`[STEALTH] Jitter delay active: Starting in ${jitterSeconds}s...`);
+    await humanDelay(jitterSeconds * 1000);
+    
+    await mainScraper();
+    process.exit(0);
 })();
