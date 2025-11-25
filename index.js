@@ -1,4 +1,4 @@
-// index.js - Industrial Grade | GitHub Actions Optimized
+// index.js - Industrial Grade | GitHub Actions Optimized | Pure Date Fix
 
 import { createHash } from 'crypto';
 import puppeteer from 'puppeteer-extra';
@@ -156,11 +156,16 @@ async function mainScraper() {
                 if (cells.length === 0) continue;
                 const col0 = cells[0];
 
+                // 1. HEADER ROW (GREEN ROW)
                 if (isDateRow(col0) && !isTimeRange(col0)) {
-                    currentDate = col0;
+                    // DATE CLEANING: Remove any time (e.g., 09:00) and everything after it
+                    // This grabs "Mon 25 Nov" and ignores "09:00 - 17:00" if present in the same cell
+                    currentDate = col0.replace(/\s\d{1,2}:\d{2}.*/, '').trim();
                     currentEvent = 'Unknown Event';
                     continue;
                 }
+
+                // 2. EVENT/TIME ROW
                 if (isTimeRange(col0)) {
                     if (cells.length > 1) {
                         currentEvent = cells[1].replace(/\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}/g, '').trim() || cells[1].trim();
@@ -171,6 +176,8 @@ async function mainScraper() {
                     }
                     continue;
                 }
+
+                // 3. JOB ROW
                 if (col0 === targetRole) {
                     const docName = (cells.length > 2) ? cells[2] : 'Unassigned';
                     if (currentDate !== 'Unknown Date' && currentEvent !== 'Unknown Event') results.push({ date: currentDate, eventName: currentEvent, doctorName: docName });
